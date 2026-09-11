@@ -11,7 +11,7 @@ type Project = {
   anchorX: number;
   anchorY: number;
   thumbnail: string;
-  view?: 'languages' | 'bands' | 'thanks';
+  view?: 'languages' | 'bands' | 'thanks' | 'blogs';
 };
 
 type Language = {
@@ -26,6 +26,13 @@ type BandEntry = {
   images?: string[];
   description: string;
   objectPosition?: string;
+};
+
+type BlogPost = {
+  id: string;
+  title: string;
+  date: string;
+  paragraphs: string[];
 };
 
 const terminalIcon = `data:image/svg+xml,${encodeURIComponent(`
@@ -182,6 +189,45 @@ const myBands: BandEntry[] = [
   },
 ];
 
+// 每新增一篇文章，就在这里追加一个对象；月份会根据 date 自动归类。
+const blogPosts: BlogPost[] = [
+  {
+    id: 'im-project',
+    title: 'im项目',
+    date: '2026-09-11',
+    paragraphs: [
+      '我的 IM 系统分为接入层、网关路由层和异步存储层，同时支持 WebSocket 和 gnet TCP 两种长连接协议。',
+      '首先是连接认证。WebSocket 在 HTTP 升级为 WebSocket 之前，从查询参数中读取 JWT，校验签名和有效期，并从 Claims 中取得 UID。gnet TCP 在连接建立后要求第一帧必须是 CmdLogin，JWT 放在 Content 字段中，验证失败就关闭连接。',
+      '认证成功后，网关创建 Client 对象，在本地 Hub 中维护 UID → Client 映射。Client 通过 Transport 接口屏蔽 WebSocket 和 TCP 的差异，Router 只面向 Client 发送消息。服务端处理消息时会用认证连接中的 UID 强制覆盖客户端传入的 From 字段，防止用户伪造发送者身份。',
+      'WebSocket 本身具有消息边界，服务端读取二进制消息后直接进行 Protobuf 反序列化；TCP 没有消息边界，因此我设计了“4 字节大端长度前缀加 Protobuf 负载”的帧格式。gnet 收到数据后先读取长度，再判断完整负载是否到达，以处理粘包和半包，同时限制最大帧长度。解析完成后，业务任务会提交到工作池，避免阻塞 Reactor 事件循环。',
+      '消息进入 Router 后，先执行去重检查。客户端为消息生成 seq，去重键是 fromUID:seq，值是服务端第一次处理时分配的 msgID。本地去重缓存默认 TTL 为 5 分钟；启用 Redis 后，还会异步写入 Redis，Redis 中的 TTL 是本地的两倍。发现重复消息时不会再次投递，而是把原来的 msgID 放进 ACK 返回给 A。',
+      '去重检查通过后，服务端校验命令范围、目标用户等字段，再通过按 UID 划分的令牌桶进行限流。超过持续速率或突发容量的消息会被拒绝。通过校验和限流后，服务端使用 Snowflake 生成全局唯一的 msgID 和时间戳。',
+      '路由时，G1 先查询本地 Hub。由于 B 连接在 G2，G1 本地查不到 B，因此根据 B 的 UID 在一致性哈希环上计算归属网关，再通过 gRPC 调用目标网关的 ForwardMessage。',
+      '一致性哈希解决的是 UID → 归属网关的稳定分配问题，节点扩缩容时只需要迁移少部分 UID；Redis 服务发现保存的是网关节点 ID 和地址，不是用户的在线位置。各网关通过带 TTL 的心跳注册自身，ClusterManager 发现节点上下线后更新哈希环和 gRPC 连接。',
+      '这里有一个实现边界：当前系统各网关只保存本节点的 UID → Client 映射，没有全局的 UID → Gateway 在线位置表。因此要保证准确路由，接入层必须让用户连接到一致性哈希计算出的归属网关；如果 B 实际连接在 G2，但哈希归属是 G3，系统就可能把在线用户误判为离线。生产环境中我会在 Redis 维护带连接版本和 TTL 的在线位置映射，例如 im:online:{uid} → gatewayID:connectionID，并通过心跳续期、Lua 脚本比较 connectionID 后删除，避免旧连接清理掉新连接。',
+      'G2 收到转发请求后查询本地 Hub。如果找到 B，就把消息放入 B 的有界发送队列，再由唯一的 WriteLoop 写入 WebSocket 或 TCP 连接，避免并发写连接。如果发送队列已满，或者 B 已经离线，G2 就把消息转入离线队列。',
+      '整体降级链路是：先尝试本地在线投递；本地不存在时，根据一致性哈希通过 gRPC 转发到归属网关；如果哈希环不可用、Forwarder 未配置或者 gRPC 转发失败，则降级到 G1 的本地离线存储。离线存储优先使用 Redis List，通过 Lua 脚本原子完成追加和裁剪；Redis 故障时继续降级到内存队列，但内存队列会在节点宕机后丢失。',
+      '完成在线投递或者离线存储尝试后，如果消息设置了 NeedAck，G1 向 A 返回 CmdAck，其中携带客户端 seq 和服务端 msgID。这个 ACK 只是“网关路由受理 ACK”，表示消息已经进入接收端发送队列，或者已经尝试进入离线队列；它不代表消息已经写入 MySQL，也不代表 B 的应用程序已经收到或读取消息。当前系统实现了发送方受理 ACK 和已读回执，但没有实现严格的接收端送达 ACK。',
+      'ACK 之后，消息被提交到容量有限的异步持久化队列，由固定数量的 worker 处理。启用 Kafka 时，Gateway 将 Protobuf 消息以 msgID 为 Key 写入 Kafka，Logic 服务批量消费并写入 MySQL，落库成功后再提交 Kafka offset。MySQL 以 msgID 作为主键，并使用 INSERT IGNORE 保证重复消费幂等。当前代码如果同时配置 Kafka 和本地 MessageStore，还会并行执行 Kafka 发布和 MySQL 直写，两条路径通过相同 msgID 实现落库幂等。',
+      'Kafka 和 MySQL 负责消息历史持久化，离线队列负责用户不在线时等待后续投递，三者职责不同，离线队列不能替代消息历史库。',
+      '对于“已受理消息不丢失”，当前实现不能提供严格保证。因为 ACK 早于 Kafka 和 MySQL 持久化；持久化队列满时可能丢弃任务；Kafka 发布失败只记录日志；Redis 离线存储失败会回退到内存，而节点宕机会丢失内存数据。因此当前更准确的说法是尽力而为的受理和至少一次倾向，而不是 ACK 后绝对不丢失。要实现严格保证，需要先把消息写入 Kafka 或事务型 Outbox 等可靠存储，再向 A 返回受理 ACK。',
+      '最后，如果 G2 已经把消息放入 B 的发送队列，但 G1 在写入 A:seq 去重标记和返回 ACK 之前宕机，A 超时后会使用相同 seq 重试。由于服务端没有找到去重记录，会把它当成新消息，重新生成 msgID 并再次投递，因此 B 可能收到两次。',
+      '去重标记放在投递后，是因为系统在重复和丢失之间选择了至少一次投递。如果在投递前先写去重标记，写完后网关宕机或发送队列已满，A 重试时会被去重逻辑拦截，消息可能永久丢失。投递后标记可能产生重复，但重复通常可以通过幂等处理。',
+      '不过当前前端只按服务端 msgID 去重，而两次处理会生成不同的 msgID，所以这个宕机窗口内仍可能重复展示。完善方案是让客户端生成稳定的 clientMsgID，重试时保持不变，并在可靠存储中对 fromUID + clientMsgID 建立唯一约束，使重试能够复用原消息状态和服务端 msgID。',
+    ],
+  },
+];
+
+function formatBlogMonth(date: string) {
+  const [year, month] = date.split('-');
+  return `${year.slice(-2)}年${Number(month)}月`;
+}
+
+function formatBlogDate(date: string) {
+  const [year, month, day] = date.split('-');
+  return `${year}年${Number(month)}月${Number(day)}日`;
+}
+
 type DragState = {
   dragging: boolean;
   sx: number;
@@ -209,6 +255,7 @@ const projects: Project[] = [
     anchorX: 26,
     anchorY: 29.5,
     thumbnail: bookIcon,
+    view: 'blogs',
   },
   {
     id: 3,
@@ -763,6 +810,195 @@ function LanguagesWindow({ onClose }: { onClose: () => void }) {
   );
 }
 
+function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void }) {
+  return (
+    <WindowShell title={post.title} wide height="78vh" onClose={onClose}>
+      <article style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+        <div
+          style={{
+            fontFamily: fonts.body,
+            fontWeight: 500,
+            fontSize: 13,
+            lineHeight: 1,
+            letterSpacing: '-0.02em',
+            color: 'rgb(134,134,139)',
+          }}
+        >
+          {formatBlogDate(post.date)}
+        </div>
+        <div
+          style={{
+            fontFamily: fonts.display,
+            fontWeight: 600,
+            fontSize: 34,
+            lineHeight: 1.05,
+            letterSpacing: '-0.06em',
+            color: 'rgb(20,20,22)',
+          }}
+        >
+          {post.title}
+        </div>
+        <div style={{ height: 1, background: 'rgb(229,229,234)' }} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {post.paragraphs.map((paragraph, paragraphIndex) => (
+            <p
+              key={`${post.id}-${paragraphIndex}`}
+              style={{
+                margin: 0,
+                fontFamily: fonts.body,
+                fontWeight: 400,
+                fontSize: 16,
+                lineHeight: 1.85,
+                letterSpacing: '-0.025em',
+                color: 'rgb(55,55,59)',
+                overflowWrap: 'anywhere',
+              }}
+            >
+              {paragraph}
+            </p>
+          ))}
+        </div>
+      </article>
+    </WindowShell>
+  );
+}
+
+function BlogsWindow({ onClose }: { onClose: () => void }) {
+  const [openPost, setOpenPost] = useState<BlogPost | null>(null);
+  const postsByMonth = blogPosts.reduce<Record<string, BlogPost[]>>((groups, post) => {
+    const month = formatBlogMonth(post.date);
+    groups[month] = groups[month] ? [...groups[month], post] : [post];
+    return groups;
+  }, {});
+
+  return (
+    <>
+      <WindowShell title="BLOG" wide height="78vh" onClose={onClose}>
+        <div
+          style={{
+            width: '100%',
+            height: 'clamp(220px, 30vw, 300px)',
+            padding: 0,
+            borderRadius: 20,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            overflow: 'hidden',
+            background: 'linear-gradient(135deg, rgb(247,247,249) 0%, rgb(226,232,240) 100%)',
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontFamily: "'Inter Display', 'Inter', Georgia, serif",
+              fontWeight: 600,
+              fontStyle: 'italic',
+              fontSize: 'clamp(96px, 20vw, 220px)',
+              lineHeight: 1,
+              letterSpacing: '-0.12em',
+              color: 'rgb(20,20,22)',
+              textAlign: 'center',
+            }}
+          >
+            BLOG
+          </div>
+        </div>
+
+        {Object.entries(postsByMonth).map(([month, posts]) => (
+          <section key={month} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div
+              style={{
+                fontFamily: fonts.display,
+                fontWeight: 600,
+                fontSize: 24,
+                lineHeight: 1.1,
+                letterSpacing: '-0.05em',
+                color: 'rgb(20,20,22)',
+              }}
+            >
+              {month}
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(5, minmax(0, 1fr))',
+                gap: 10,
+              }}
+            >
+              {posts.map((post, postIndex) => (
+                <button
+                  key={post.id}
+                  type="button"
+                  onClick={() => setOpenPost(post)}
+                  style={{
+                    minHeight: 132,
+                    padding: 12,
+                    border: '1px solid rgb(229,229,234)',
+                    borderRadius: 14,
+                    background: 'rgb(250,250,252)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: 12,
+                    textAlign: 'left',
+                    cursor: 'pointer',
+                    transition: 'transform 0.18s ease, background 0.18s ease',
+                  }}
+                >
+                  <span
+                    style={{
+                      fontFamily: fonts.body,
+                      fontWeight: 500,
+                      fontSize: 12,
+                      lineHeight: 1,
+                      color: 'rgb(134,134,139)',
+                    }}
+                  >
+                    {String(postIndex + 1).padStart(2, '0')}
+                  </span>
+                  <span
+                    style={{
+                      fontFamily: "'Inter Display', 'Inter', Georgia, serif",
+                      fontWeight: 600,
+                      fontStyle: 'italic',
+                      fontSize: 18,
+                      lineHeight: 1.1,
+                      letterSpacing: '-0.05em',
+                      color: 'rgb(35,35,38)',
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    {post.title}
+                  </span>
+                  <span
+                    style={{
+                      fontFamily: fonts.body,
+                      fontWeight: 400,
+                      fontSize: 11,
+                      lineHeight: 1,
+                      letterSpacing: '-0.02em',
+                      color: 'rgb(134,134,139)',
+                    }}
+                  >
+                    {formatBlogDate(post.date)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </section>
+        ))}
+      </WindowShell>
+
+      {openPost ? <BlogPostWindow post={openPost} onClose={() => setOpenPost(null)} /> : null}
+    </>
+  );
+}
+
 function BandImages({ band }: { band: BandEntry }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%' }}>
@@ -1300,6 +1536,8 @@ function App() {
       {openProject &&
         (openProject.view === 'languages' ? (
           <LanguagesWindow onClose={closeProject} />
+        ) : openProject.view === 'blogs' ? (
+          <BlogsWindow onClose={closeProject} />
         ) : openProject.view === 'bands' ? (
           <BandsWindow onClose={closeProject} />
         ) : openProject.view === 'thanks' ? (
