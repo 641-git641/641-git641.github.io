@@ -999,7 +999,7 @@ function ThanksWindow({ project, onClose }: { project: Project; onClose: () => v
 
         <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={headingStyle}>毫不吝啬为我解惑的网友</div>
-          <div style={textStyle}>羊肉、01、心外无物、4edvour、花岛、午餐肉...</div>
+          <div style={textStyle}>羊肉、01、心外无物、4evour、花岛、午餐肉、白猫...</div>
         </section>
       </div>
     </WindowShell>
@@ -1208,7 +1208,7 @@ function NotesWindow({ onClose }: { onClose: () => void }) {
 function DockBar({ onAbout }: { onAbout: () => void }) {
   return (
     <nav
-      aria-label="Portfolio navigation"
+      aria-label="我的博客"
       style={{
         position: 'absolute',
         bottom: 64,
