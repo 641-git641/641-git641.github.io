@@ -993,7 +993,7 @@ function ThanksWindow({ project, onClose }: { project: Project; onClose: () => v
         <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={headingStyle}>感谢我的朋友们 - 排名不分先后，我想到那条打哪条</div>
           <div style={textStyle}>
-            Mumuzi、炸酱面有优惠券、无涯、zucci、Jules、Luv7e、Cont1nus3、竹官、VvvVvV、牧孤星、切小块、超吉可口！、Mi Manchi、zjr、Heaven、易喜、生猛野猪林、叶不羞
+            Mumuzi、炸酱面有优惠券、无涯、zucci、Jules、Luv7e、Cont1nus3、竹官、VvvVvV、牧孤星、切小块、超吉可口！、Mi Manchi、zjr、Heaven、易喜、生猛野猪林、叶不羞、Raymen
           </div>
         </section>
 
