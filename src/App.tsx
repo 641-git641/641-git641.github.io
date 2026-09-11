@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react';
 
 type Position = {
   x: number;
@@ -230,6 +238,7 @@ function formatBlogDate(date: string) {
 
 type DragState = {
   dragging: boolean;
+  pointerId: number | null;
   sx: number;
   sy: number;
   ox: number;
@@ -244,32 +253,32 @@ const projects: Project[] = [
   {
     id: 1,
     title: '语言 & 工具',
-    anchorX: 42.75,
-    anchorY: 58.5,
+    anchorX: 24,
+    anchorY: 30,
     thumbnail: terminalIcon,
     view: 'languages',
   },
   {
     id: 2,
     title: 'BLOG',
-    anchorX: 26,
-    anchorY: 29.5,
+    anchorX: 76,
+    anchorY: 30,
     thumbnail: bookIcon,
     view: 'blogs',
   },
   {
     id: 3,
     title: '音乐',
-    anchorX: 23.33,
-    anchorY: 60.88,
+    anchorX: 24,
+    anchorY: 63,
     thumbnail: bandImage,
     view: 'bands',
   },
   {
     id: 4,
     title: '致谢',
-    anchorX: 68,
-    anchorY: 62.13,
+    anchorX: 76,
+    anchorY: 63,
     thumbnail:
       '/Friend.jpg',
     view: 'thanks',
@@ -277,8 +286,8 @@ const projects: Project[] = [
   {
     id: 5,
     title: '莫比乌斯环',
-    anchorX: 73.92,
-    anchorY: 40.75,
+    anchorX: 50,
+    anchorY: 47,
     thumbnail:
       '/infinity-particle-pixel-transparent.gif',
   },
@@ -294,10 +303,35 @@ const fonts = {
   display: "'Inter Display', 'Inter', sans-serif",
 };
 
+const mobileCardAnchors: Record<number, Position> = {
+  1: { x: 25, y: 23 },
+  2: { x: 75, y: 23 },
+  3: { x: 25, y: 50 },
+  4: { x: 75, y: 50 },
+  5: { x: 50, y: 73 },
+};
+
+function useIsCompactViewport() {
+  const [isCompact, setIsCompact] = useState(() =>
+    typeof window !== 'undefined' && window.innerWidth <= 680,
+  );
+
+  useEffect(() => {
+    const handleResize = () => setIsCompact(window.innerWidth <= 680);
+    window.addEventListener('resize', handleResize, { passive: true });
+    handleResize();
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return isCompact;
+}
+
 function useDraggable() {
   const [pos, setPos] = useState<Position>({ x: 0, y: 0 });
+  const positionRef = useRef<Position>({ x: 0, y: 0 });
   const dragState = useRef<DragState>({
     dragging: false,
+    pointerId: null,
     sx: 0,
     sy: 0,
     ox: 0,
@@ -307,55 +341,76 @@ function useDraggable() {
   });
   const isDraggingRef = useRef(false);
 
-  const onMouseDown = useCallback(
-    (event: MouseEvent<HTMLElement>) => {
-      if (event.button !== 0) return;
+  const onPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
 
-      event.preventDefault();
-      const state = dragState.current;
-      state.dragging = true;
-      state.sx = event.clientX;
-      state.sy = event.clientY;
-      state.ox = pos.x;
-      state.oy = pos.y;
-      state.cx = event.clientX;
-      state.cy = event.clientY;
-      isDraggingRef.current = false;
+    event.preventDefault();
+    const state = dragState.current;
+    state.dragging = true;
+    state.pointerId = event.pointerId;
+    state.sx = event.clientX;
+    state.sy = event.clientY;
+    state.ox = positionRef.current.x;
+    state.oy = positionRef.current.y;
+    state.cx = event.clientX;
+    state.cy = event.clientY;
+    isDraggingRef.current = false;
 
-      const handleMove = (moveEvent: globalThis.MouseEvent) => {
-        const current = dragState.current;
-        if (!current.dragging) return;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is not available in a few older mobile browsers.
+    }
 
-        current.cx = moveEvent.clientX;
-        current.cy = moveEvent.clientY;
-        const dx = current.cx - current.sx;
-        const dy = current.cy - current.sy;
+    const handleMove = (moveEvent: globalThis.PointerEvent) => {
+      const current = dragState.current;
+      if (!current.dragging || moveEvent.pointerId !== current.pointerId) return;
 
-        if (Math.hypot(dx, dy) >= 5) {
-          isDraggingRef.current = true;
-        }
+      current.cx = moveEvent.clientX;
+      current.cy = moveEvent.clientY;
+      const dx = current.cx - current.sx;
+      const dy = current.cy - current.sy;
 
-        setPos({ x: current.ox + dx, y: current.oy + dy });
-      };
+      if (Math.hypot(dx, dy) >= 5) {
+        isDraggingRef.current = true;
+      }
 
-      const handleUp = () => {
-        dragState.current.dragging = false;
-        window.removeEventListener('mousemove', handleMove);
-        window.removeEventListener('mouseup', handleUp);
-      };
+      const nextPosition = { x: current.ox + dx, y: current.oy + dy };
+      positionRef.current = nextPosition;
+      setPos(nextPosition);
+    };
 
-      window.addEventListener('mousemove', handleMove);
-      window.addEventListener('mouseup', handleUp);
-    },
-    [pos.x, pos.y],
-  );
+    const handleEnd = (endEvent: globalThis.PointerEvent) => {
+      if (endEvent.pointerId !== dragState.current.pointerId) return;
+      dragState.current.dragging = false;
+      dragState.current.pointerId = null;
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleEnd);
+      window.removeEventListener('pointercancel', handleEnd);
+    };
 
-  return { pos, onMouseDown, isDraggingRef };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleEnd);
+    window.addEventListener('pointercancel', handleEnd);
+  }, []);
+
+  return { pos, onPointerDown, isDraggingRef };
 }
 
-function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: Project) => void }) {
+function ProjectCard({
+  project,
+  onOpen,
+  compact,
+}: {
+  project: Project;
+  onOpen: (project: Project) => void;
+  compact: boolean;
+}) {
   const [hovered, setHovered] = useState(false);
-  const { pos, onMouseDown, isDraggingRef } = useDraggable();
+  const { pos, onPointerDown, isDraggingRef } = useDraggable();
+  const anchor = compact
+    ? mobileCardAnchors[project.id] ?? { x: project.anchorX, y: project.anchorY }
+    : { x: project.anchorX, y: project.anchorY };
 
   const handleClick = () => {
     if (isDraggingRef.current) {
@@ -375,8 +430,8 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: 
 
   const cardStyle: CSSProperties = {
     position: 'absolute',
-    left: `calc(${project.anchorX}% - 52px)`,
-    top: `calc(${project.anchorY}% - 64px)`,
+    left: `calc(${anchor.x}% - 52px)`,
+    top: `calc(${anchor.y}% - 64px)`,
     transform: `translate(${pos.x}px, ${pos.y}px)`,
     zIndex: 2,
     cursor: 'grab',
@@ -389,7 +444,7 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: 
   };
 
   const wrapperStyle: CSSProperties = {
-    padding: 12,
+    padding: compact ? 8 : 12,
     borderRadius: 8,
     border: `2px solid ${hovered ? 'rgba(255,255,255,0.2)' : 'transparent'}`,
     background: hovered ? 'rgba(0,0,0,0.16)' : 'transparent',
@@ -403,7 +458,7 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: 
     transition: 'background 0.18s ease, padding 0.18s ease',
     fontFamily: fonts.body,
     fontWeight: 400,
-    fontSize: 16,
+    fontSize: compact ? 14 : 16,
     lineHeight: '1.4em',
     letterSpacing: '-0.04em',
     color: 'rgb(247,247,247)',
@@ -416,9 +471,12 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: 
       role="button"
       tabIndex={0}
       aria-label={`Open project ${project.title}`}
-      onMouseDown={onMouseDown}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onPointerDown={onPointerDown}
+      onPointerEnter={(event) => {
+        if (event.pointerType !== 'touch') setHovered(true);
+      }}
+      onPointerLeave={() => setHovered(false)}
+      onContextMenu={(event) => event.preventDefault()}
       onClick={handleClick}
       onKeyDown={handleKeyDown}
     >
@@ -429,8 +487,8 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: (project: 
           draggable={false}
           style={{
             display: 'block',
-            width: 80,
-            height: 60,
+            width: compact ? 68 : 80,
+            height: compact ? 51 : 60,
             objectFit: 'cover',
             objectPosition: project.id === 3 ? 'center top' : 'center',
             borderRadius: 8,
@@ -456,8 +514,10 @@ function WindowShell({ title, onClose, children, wide = false, height }: WindowS
   const [visible, setVisible] = useState(false);
   const [windowPosition, setWindowPosition] = useState<Position>({ x: 0, y: 0 });
   const [windowDragging, setWindowDragging] = useState(false);
+  const compact = useIsCompactViewport();
   const windowDragState = useRef({
     dragging: false,
+    pointerId: null as number | null,
     sx: 0,
     sy: 0,
     ox: 0,
@@ -478,43 +538,55 @@ function WindowShell({ title, onClose, children, wide = false, height }: WindowS
     return () => window.removeEventListener('keydown', handleEscape);
   }, [onClose]);
 
-  const handleTitleMouseDown = (event: MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
+  const handleTitlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
     event.preventDefault();
 
     const state = windowDragState.current;
     state.dragging = true;
+    state.pointerId = event.pointerId;
     state.sx = event.clientX;
     state.sy = event.clientY;
     state.ox = windowPosition.x;
     state.oy = windowPosition.y;
     setWindowDragging(true);
 
-    const handleMove = (moveEvent: globalThis.MouseEvent) => {
-      if (!windowDragState.current.dragging) return;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is not available in a few older mobile browsers.
+    }
+
+    const handleMove = (moveEvent: globalThis.PointerEvent) => {
+      const current = windowDragState.current;
+      if (!current.dragging || moveEvent.pointerId !== current.pointerId) return;
       setWindowPosition({
-        x: windowDragState.current.ox + moveEvent.clientX - windowDragState.current.sx,
-        y: windowDragState.current.oy + moveEvent.clientY - windowDragState.current.sy,
+        x: current.ox + moveEvent.clientX - current.sx,
+        y: current.oy + moveEvent.clientY - current.sy,
       });
     };
 
-    const handleUp = () => {
+    const handleEnd = (endEvent: globalThis.PointerEvent) => {
+      if (endEvent.pointerId !== windowDragState.current.pointerId) return;
       windowDragState.current.dragging = false;
+      windowDragState.current.pointerId = null;
       setWindowDragging(false);
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleEnd);
+      window.removeEventListener('pointercancel', handleEnd);
     };
 
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleEnd);
+    window.addEventListener('pointercancel', handleEnd);
   };
 
   const panelStyle: CSSProperties = {
-    width: wide ? '70vw' : '60vw',
-    maxWidth: wide ? 840 : 720,
+    width: compact ? '100%' : wide ? '70vw' : '60vw',
+    maxWidth: compact ? 'none' : wide ? 840 : 720,
     height,
-    maxHeight: height ?? '70vh',
-    borderRadius: 24,
+    maxHeight: compact ? 'calc(100dvh - 24px)' : height ?? '70vh',
+    borderRadius: compact ? 18 : 24,
     background: 'white',
     boxShadow: '0 32px 80px rgba(0,0,0,0.28)',
     pointerEvents: 'all',
@@ -537,6 +609,7 @@ function WindowShell({ title, onClose, children, wide = false, height }: WindowS
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
+        padding: compact ? 12 : 0,
         zIndex: 50,
         pointerEvents: 'none',
       }}
@@ -552,8 +625,9 @@ function WindowShell({ title, onClose, children, wide = false, height }: WindowS
             display: 'flex',
             alignItems: 'center',
             gap: 12,
+            touchAction: 'none',
           }}
-          onMouseDown={handleTitleMouseDown}
+          onPointerDown={handleTitlePointerDown}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <TrafficLight color="rgb(253,93,92)" label="Close window" onClick={onClose} />
@@ -583,8 +657,8 @@ function WindowShell({ title, onClose, children, wide = false, height }: WindowS
             flex: 1,
             minHeight: 0,
             overflowY: 'auto',
-            padding: 16,
-            gap: 16,
+            padding: compact ? 12 : 16,
+            gap: compact ? 12 : 16,
             display: 'flex',
             flexDirection: 'column',
           }}
@@ -601,6 +675,7 @@ function TrafficLight({ color, label, onClick }: { color: string; label: string;
     <button
       type="button"
       aria-label={label}
+      onPointerDown={(event) => event.stopPropagation()}
       onClick={(event) => {
         event.stopPropagation();
         onClick();
@@ -811,9 +886,11 @@ function LanguagesWindow({ onClose }: { onClose: () => void }) {
 }
 
 function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void }) {
+  const compact = useIsCompactViewport();
+
   return (
     <WindowShell title={post.title} wide height="78vh" onClose={onClose}>
-      <article style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      <article style={{ display: 'flex', flexDirection: 'column', gap: compact ? 16 : 20 }}>
         <div
           style={{
             fontFamily: fonts.body,
@@ -847,7 +924,7 @@ function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void
                 margin: 0,
                 fontFamily: fonts.body,
                 fontWeight: 400,
-                fontSize: 16,
+                fontSize: compact ? 15 : 16,
                 lineHeight: 1.85,
                 letterSpacing: '-0.025em',
                 color: 'rgb(55,55,59)',
@@ -865,6 +942,7 @@ function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void
 
 function BlogsWindow({ onClose }: { onClose: () => void }) {
   const [openPost, setOpenPost] = useState<BlogPost | null>(null);
+  const compact = useIsCompactViewport();
   const postsByMonth = blogPosts.reduce<Record<string, BlogPost[]>>((groups, post) => {
     const month = formatBlogMonth(post.date);
     groups[month] = groups[month] ? [...groups[month], post] : [post];
@@ -877,7 +955,7 @@ function BlogsWindow({ onClose }: { onClose: () => void }) {
         <div
           style={{
             width: '100%',
-            height: 'clamp(220px, 30vw, 300px)',
+            height: compact ? 'clamp(160px, 46vw, 220px)' : 'clamp(220px, 30vw, 300px)',
             padding: 0,
             borderRadius: 20,
             display: 'flex',
@@ -897,7 +975,7 @@ function BlogsWindow({ onClose }: { onClose: () => void }) {
               fontFamily: "'Inter Display', 'Inter', Georgia, serif",
               fontWeight: 600,
               fontStyle: 'italic',
-              fontSize: 'clamp(96px, 20vw, 220px)',
+              fontSize: compact ? 'clamp(64px, 22vw, 112px)' : 'clamp(96px, 20vw, 220px)',
               lineHeight: 1,
               letterSpacing: '-0.12em',
               color: 'rgb(20,20,22)',
@@ -925,7 +1003,9 @@ function BlogsWindow({ onClose }: { onClose: () => void }) {
             <div
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(5, minmax(0, 1fr))',
+                gridTemplateColumns: compact
+                  ? 'repeat(2, minmax(0, 1fr))'
+                  : 'repeat(5, minmax(0, 1fr))',
                 gap: 10,
               }}
             >
@@ -1070,7 +1150,8 @@ function BandSection({
   entries: BandEntry[];
   layout?: 'split' | 'stacked';
 }) {
-  const isSplit = layout === 'split';
+  const compact = useIsCompactViewport();
+  const isSplit = layout === 'split' && !compact;
 
   return (
     <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1442,20 +1523,22 @@ function NotesWindow({ onClose }: { onClose: () => void }) {
 }
 
 function DockBar({ onAbout }: { onAbout: () => void }) {
+  const compact = useIsCompactViewport();
+
   return (
     <nav
       aria-label="我的博客"
       style={{
         position: 'absolute',
-        bottom: 64,
+        bottom: compact ? 24 : 64,
         left: '50%',
         transform: 'translateX(-50%)',
         zIndex: 4,
         display: 'flex',
         alignItems: 'center',
-        gap: 16,
-        padding: 12,
-        borderRadius: 24,
+        gap: compact ? 12 : 16,
+        padding: compact ? 10 : 12,
+        borderRadius: compact ? 20 : 24,
         background: 'rgba(255,255,255,0.1)',
         border: '1px solid rgba(255,255,255,0.2)',
         backdropFilter: 'blur(5px)',
@@ -1475,6 +1558,7 @@ function DockBar({ onAbout }: { onAbout: () => void }) {
 function App() {
   const [openProject, setOpenProject] = useState<Project | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const compact = useIsCompactViewport();
 
   const closeProject = useCallback(() => setOpenProject(null), []);
   const closeAbout = useCallback(() => setAboutOpen(false), []);
@@ -1528,7 +1612,7 @@ function App() {
       />
 
       {projects.map((project) => (
-        <ProjectCard key={project.id} project={project} onOpen={setOpenProject} />
+        <ProjectCard key={project.id} project={project} onOpen={setOpenProject} compact={compact} />
       ))}
 
       <DockBar onAbout={() => setAboutOpen(true)} />
