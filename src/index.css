@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Inter+Display:wght@500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes springIn {
+  0% { opacity:0; transform:scale(0.8); }
+  100% { opacity:1; transform:scale(1); }
+}
+
+.spring-in { animation: springIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+
+body {
+  margin:0;
+  padding:0;
+  font-family:'Inter',sans-serif;
+  background:white;
+  overflow:hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+a {
+  font: inherit;
+}
