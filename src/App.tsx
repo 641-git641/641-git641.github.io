@@ -36,11 +36,20 @@ type BandEntry = {
   objectPosition?: string;
 };
 
+type BlogSection = {
+  /** 1 = 大标题，2 = 小标题 */
+  level: 1 | 2;
+  heading: string;
+  paragraphs?: string[];
+};
+
 type BlogPost = {
   id: string;
   title: string;
   date: string;
-  paragraphs: string[];
+  sections: BlogSection[];
+  /** 配图开关：目前仅企业级 DevOps 架构一图 */
+  figure?: 'devops-architecture';
 };
 
 const terminalIcon = `data:image/svg+xml,${encodeURIComponent(`
@@ -197,32 +206,267 @@ const myBands: BandEntry[] = [
   },
 ];
 
-// 每新增一篇文章，就在这里追加一个对象；月份会根据 date 自动归类。
+// 每新增一篇文章，就在这里追加一个对象；sections 用 level 1/2 区分大标题与小标题，月份会根据 date 自动归类。
 const blogPosts: BlogPost[] = [
   {
     id: 'im-project',
     title: 'im项目',
     date: '2026-09-11',
-    paragraphs: [
-      '我的 IM 系统分为接入层、网关路由层和异步存储层，同时支持 WebSocket 和 gnet TCP 两种长连接协议。',
-      '首先是连接认证。WebSocket 在 HTTP 升级为 WebSocket 之前，从查询参数中读取 JWT，校验签名和有效期，并从 Claims 中取得 UID。gnet TCP 在连接建立后要求第一帧必须是 CmdLogin，JWT 放在 Content 字段中，验证失败就关闭连接。',
-      '认证成功后，网关创建 Client 对象，在本地 Hub 中维护 UID → Client 映射。Client 通过 Transport 接口屏蔽 WebSocket 和 TCP 的差异，Router 只面向 Client 发送消息。服务端处理消息时会用认证连接中的 UID 强制覆盖客户端传入的 From 字段，防止用户伪造发送者身份。',
-      'WebSocket 本身具有消息边界，服务端读取二进制消息后直接进行 Protobuf 反序列化；TCP 没有消息边界，因此我设计了“4 字节大端长度前缀加 Protobuf 负载”的帧格式。gnet 收到数据后先读取长度，再判断完整负载是否到达，以处理粘包和半包，同时限制最大帧长度。解析完成后，业务任务会提交到工作池，避免阻塞 Reactor 事件循环。',
-      '消息进入 Router 后，先执行去重检查。客户端为消息生成 seq，去重键是 fromUID:seq，值是服务端第一次处理时分配的 msgID。本地去重缓存默认 TTL 为 5 分钟；启用 Redis 后，还会异步写入 Redis，Redis 中的 TTL 是本地的两倍。发现重复消息时不会再次投递，而是把原来的 msgID 放进 ACK 返回给 A。',
-      '去重检查通过后，服务端校验命令范围、目标用户等字段，再通过按 UID 划分的令牌桶进行限流。超过持续速率或突发容量的消息会被拒绝。通过校验和限流后，服务端使用 Snowflake 生成全局唯一的 msgID 和时间戳。',
-      '路由时，G1 先查询本地 Hub。由于 B 连接在 G2，G1 本地查不到 B，因此根据 B 的 UID 在一致性哈希环上计算归属网关，再通过 gRPC 调用目标网关的 ForwardMessage。',
-      '一致性哈希解决的是 UID → 归属网关的稳定分配问题，节点扩缩容时只需要迁移少部分 UID；Redis 服务发现保存的是网关节点 ID 和地址，不是用户的在线位置。各网关通过带 TTL 的心跳注册自身，ClusterManager 发现节点上下线后更新哈希环和 gRPC 连接。',
-      '这里有一个实现边界：当前系统各网关只保存本节点的 UID → Client 映射，没有全局的 UID → Gateway 在线位置表。因此要保证准确路由，接入层必须让用户连接到一致性哈希计算出的归属网关；如果 B 实际连接在 G2，但哈希归属是 G3，系统就可能把在线用户误判为离线。生产环境中我会在 Redis 维护带连接版本和 TTL 的在线位置映射，例如 im:online:{uid} → gatewayID:connectionID，并通过心跳续期、Lua 脚本比较 connectionID 后删除，避免旧连接清理掉新连接。',
-      'G2 收到转发请求后查询本地 Hub。如果找到 B，就把消息放入 B 的有界发送队列，再由唯一的 WriteLoop 写入 WebSocket 或 TCP 连接，避免并发写连接。如果发送队列已满，或者 B 已经离线，G2 就把消息转入离线队列。',
-      '整体降级链路是：先尝试本地在线投递；本地不存在时，根据一致性哈希通过 gRPC 转发到归属网关；如果哈希环不可用、Forwarder 未配置或者 gRPC 转发失败，则降级到 G1 的本地离线存储。离线存储优先使用 Redis List，通过 Lua 脚本原子完成追加和裁剪；Redis 故障时继续降级到内存队列，但内存队列会在节点宕机后丢失。',
-      '完成在线投递或者离线存储尝试后，如果消息设置了 NeedAck，G1 向 A 返回 CmdAck，其中携带客户端 seq 和服务端 msgID。这个 ACK 只是“网关路由受理 ACK”，表示消息已经进入接收端发送队列，或者已经尝试进入离线队列；它不代表消息已经写入 MySQL，也不代表 B 的应用程序已经收到或读取消息。当前系统实现了发送方受理 ACK 和已读回执，但没有实现严格的接收端送达 ACK。',
-      'ACK 之后，消息被提交到容量有限的异步持久化队列，由固定数量的 worker 处理。启用 Kafka 时，Gateway 将 Protobuf 消息以 msgID 为 Key 写入 Kafka，Logic 服务批量消费并写入 MySQL，落库成功后再提交 Kafka offset。MySQL 以 msgID 作为主键，并使用 INSERT IGNORE 保证重复消费幂等。当前代码如果同时配置 Kafka 和本地 MessageStore，还会并行执行 Kafka 发布和 MySQL 直写，两条路径通过相同 msgID 实现落库幂等。',
-      'Kafka 和 MySQL 负责消息历史持久化，离线队列负责用户不在线时等待后续投递，三者职责不同，离线队列不能替代消息历史库。',
-      '对于“已受理消息不丢失”，当前实现不能提供严格保证。因为 ACK 早于 Kafka 和 MySQL 持久化；持久化队列满时可能丢弃任务；Kafka 发布失败只记录日志；Redis 离线存储失败会回退到内存，而节点宕机会丢失内存数据。因此当前更准确的说法是尽力而为的受理和至少一次倾向，而不是 ACK 后绝对不丢失。要实现严格保证，需要先把消息写入 Kafka 或事务型 Outbox 等可靠存储，再向 A 返回受理 ACK。',
-      '最后，如果 G2 已经把消息放入 B 的发送队列，但 G1 在写入 A:seq 去重标记和返回 ACK 之前宕机，A 超时后会使用相同 seq 重试。由于服务端没有找到去重记录，会把它当成新消息，重新生成 msgID 并再次投递，因此 B 可能收到两次。',
-      '去重标记放在投递后，是因为系统在重复和丢失之间选择了至少一次投递。如果在投递前先写去重标记，写完后网关宕机或发送队列已满，A 重试时会被去重逻辑拦截，消息可能永久丢失。投递后标记可能产生重复，但重复通常可以通过幂等处理。',
-      '不过当前前端只按服务端 msgID 去重，而两次处理会生成不同的 msgID，所以这个宕机窗口内仍可能重复展示。完善方案是让客户端生成稳定的 clientMsgID，重试时保持不变，并在可靠存储中对 fromUID + clientMsgID 建立唯一约束，使重试能够复用原消息状态和服务端 msgID。',
+    sections: [
+      {
+        level: 1,
+        heading: '总体分层',
+        paragraphs: [
+          '我的 IM 系统分为接入层、网关路由层和异步存储层，同时支持 WebSocket 和 gnet TCP 两种长连接协议。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '连接与认证',
+        paragraphs: [
+          '首先是连接认证。WebSocket 在 HTTP 升级为 WebSocket 之前，从查询参数中读取 JWT，校验签名和有效期，并从 Claims 中取得 UID。gnet TCP 在连接建立后要求第一帧必须是 CmdLogin，JWT 放在 Content 字段中，验证失败就关闭连接。',
+          '认证成功后，网关创建 Client 对象，在本地 Hub 中维护 UID → Client 映射。Client 通过 Transport 接口屏蔽 WebSocket 和 TCP 的差异，Router 只面向 Client 发送消息。服务端处理消息时会用认证连接中的 UID 强制覆盖客户端传入的 From 字段，防止用户伪造发送者身份。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '协议与帧格式',
+        paragraphs: [
+          'WebSocket 本身具有消息边界，服务端读取二进制消息后直接进行 Protobuf 反序列化；TCP 没有消息边界，因此我设计了“4 字节大端长度前缀加 Protobuf 负载”的帧格式。gnet 收到数据后先读取长度，再判断完整负载是否到达，以处理粘包和半包，同时限制最大帧长度。解析完成后，业务任务会提交到工作池，避免阻塞 Reactor 事件循环。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '去重、校验与限流',
+        paragraphs: [
+          '消息进入 Router 后，先执行去重检查。客户端为消息生成 seq，去重键是 fromUID:seq，值是服务端第一次处理时分配的 msgID。本地去重缓存默认 TTL 为 5 分钟；启用 Redis 后，还会异步写入 Redis，Redis 中的 TTL 是本地的两倍。发现重复消息时不会再次投递，而是把原来的 msgID 放进 ACK 返回给 A。',
+          '去重检查通过后，服务端校验命令范围、目标用户等字段，再通过按 UID 划分的令牌桶进行限流。超过持续速率或突发容量的消息会被拒绝。通过校验和限流后，服务端使用 Snowflake 生成全局唯一的 msgID 和时间戳。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '跨网关路由',
+      },
+      {
+        level: 2,
+        heading: '本地查询与 gRPC 转发',
+        paragraphs: [
+          '路由时，G1 先查询本地 Hub。由于 B 连接在 G2，G1 本地查不到 B，因此根据 B 的 UID 在一致性哈希环上计算归属网关，再通过 gRPC 调用目标网关的 ForwardMessage。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '一致性哈希与服务发现',
+        paragraphs: [
+          '一致性哈希解决的是 UID → 归属网关的稳定分配问题，节点扩缩容时只需要迁移少部分 UID；Redis 服务发现保存的是网关节点 ID 和地址，不是用户的在线位置。各网关通过带 TTL 的心跳注册自身，ClusterManager 发现节点上下线后更新哈希环和 gRPC 连接。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '在线位置表的缺口',
+        paragraphs: [
+          '这里有一个实现边界：当前系统各网关只保存本节点的 UID → Client 映射，没有全局的 UID → Gateway 在线位置表。因此要保证准确路由，接入层必须让用户连接到一致性哈希计算出的归属网关；如果 B 实际连接在 G2，但哈希归属是 G3，系统就可能把在线用户误判为离线。生产环境中我会在 Redis 维护带连接版本和 TTL 的在线位置映射，例如 im:online:{uid} → gatewayID:connectionID，并通过心跳续期、Lua 脚本比较 connectionID 后删除，避免旧连接清理掉新连接。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '在线投递与降级',
+        paragraphs: [
+          'G2 收到转发请求后查询本地 Hub。如果找到 B，就把消息放入 B 的有界发送队列，再由唯一的 WriteLoop 写入 WebSocket 或 TCP 连接，避免并发写连接。如果发送队列已满，或者 B 已经离线，G2 就把消息转入离线队列。',
+          '整体降级链路是：先尝试本地在线投递；本地不存在时，根据一致性哈希通过 gRPC 转发到归属网关；如果哈希环不可用、Forwarder 未配置或者 gRPC 转发失败，则降级到 G1 的本地离线存储。离线存储优先使用 Redis List，通过 Lua 脚本原子完成追加和裁剪；Redis 故障时继续降级到内存队列，但内存队列会在节点宕机后丢失。',
+        ],
+      },
+      {
+        level: 1,
+        heading: 'ACK 语义与异步持久化',
+      },
+      {
+        level: 2,
+        heading: '受理 ACK 的语义',
+        paragraphs: [
+          '完成在线投递或者离线存储尝试后，如果消息设置了 NeedAck，G1 向 A 返回 CmdAck，其中携带客户端 seq 和服务端 msgID。这个 ACK 只是“网关路由受理 ACK”，表示消息已经进入接收端发送队列，或者已经尝试进入离线队列；它不代表消息已经写入 MySQL，也不代表 B 的应用程序已经收到或读取消息。当前系统实现了发送方受理 ACK 和已读回执，但没有实现严格的接收端送达 ACK。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '异步落库与职责区分',
+        paragraphs: [
+          'ACK 之后，消息被提交到容量有限的异步持久化队列，由固定数量的 worker 处理。启用 Kafka 时，Gateway 将 Protobuf 消息以 msgID 为 Key 写入 Kafka，Logic 服务批量消费并写入 MySQL，落库成功后再提交 Kafka offset。MySQL 以 msgID 作为主键，并使用 INSERT IGNORE 保证重复消费幂等。当前代码如果同时配置 Kafka 和本地 MessageStore，还会并行执行 Kafka 发布和 MySQL 直写，两条路径通过相同 msgID 实现落库幂等。',
+          'Kafka 和 MySQL 负责消息历史持久化，离线队列负责用户不在线时等待后续投递，三者职责不同，离线队列不能替代消息历史库。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '交付保证的边界',
+        paragraphs: [
+          '对于“已受理消息不丢失”，当前实现不能提供严格保证。因为 ACK 早于 Kafka 和 MySQL 持久化；持久化队列满时可能丢弃任务；Kafka 发布失败只记录日志；Redis 离线存储失败会回退到内存，而节点宕机会丢失内存数据。因此当前更准确的说法是尽力而为的受理和至少一次倾向，而不是 ACK 后绝对不丢失。要实现严格保证，需要先把消息写入 Kafka 或事务型 Outbox 等可靠存储，再向 A 返回受理 ACK。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '重复与幂等的取舍',
+        paragraphs: [
+          '最后，如果 G2 已经把消息放入 B 的发送队列，但 G1 在写入 A:seq 去重标记和返回 ACK 之前宕机，A 超时后会使用相同 seq 重试。由于服务端没有找到去重记录，会把它当成新消息，重新生成 msgID 并再次投递，因此 B 可能收到两次。',
+          '去重标记放在投递后，是因为系统在重复和丢失之间选择了至少一次投递。如果在投递前先写去重标记，写完后网关宕机或发送队列已满，A 重试时会被去重逻辑拦截，消息可能永久丢失。投递后标记可能产生重复，但重复通常可以通过幂等处理。',
+          '不过当前前端只按服务端 msgID 去重，而两次处理会生成不同的 msgID，所以这个宕机窗口内仍可能重复展示。完善方案是让客户端生成稳定的 clientMsgID，重试时保持不变，并在可靠存储中对 fromUID + clientMsgID 建立唯一约束，使重试能够复用原消息状态和服务端 msgID。',
+        ],
+      },
     ],
+  },
+  {
+    id: 'devops-architecture',
+    title: '企业级 DevOps 架构',
+    date: '2026-09-12',
+    sections: [
+      {
+        level: 1,
+        heading: '目标与原则',
+        paragraphs: [
+          '企业级 DevOps 的目标不是引入更多工具，而是让每一次代码变更从提交到上线都可预期、可重复、可回滚。整套架构围绕四个原则：单一可信源、一切皆代码、一次构建多环境晋升、最小权限。',
+          '整体分为六层：源码与协作、持续集成、制品管理、环境与基础设施、持续部署、可观测与反馈。安全与权限不单独成层，而是横切在所有环节中的约束。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '源码与协作',
+        paragraphs: [
+          '源码与协作层以 Git 作为唯一可信源，应用代码、基础设施声明、Kubernetes 清单和流水线定义全部进入仓库。分支策略采用主干开发加短生命周期分支：功能分支以天为单位，经合并请求评审后合入主干；主干受保护，禁止直接推送。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '持续集成',
+        paragraphs: [
+          '持续集成层对每次提交和合并请求运行同一套流水线：代码检查、单元测试、静态分析、依赖与密钥扫描、镜像构建。任何一步失败都会阻断合并。流水线定义与代码放在同一个仓库，修改流水线同样需要评审。单次流水线应控制在十分钟以内，否则开发者会想办法绕过它。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '制品管理',
+        paragraphs: [
+          '制品层存放构建产物，通常是容器镜像与软件包。规则是“一次构建、多环境晋升”：同一个镜像经过测试后原样进入生产，禁止在不同环境重新构建。镜像使用基于提交号的不可变标签，不使用 latest，并在入库前完成签名与漏洞扫描。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '环境与基础设施',
+      },
+      {
+        level: 2,
+        heading: '环境分级',
+        paragraphs: [
+          '环境按用途分级：开发、测试、预发、生产。各级使用独立的账号或命名空间，网络与权限相互隔离，生产数据与密钥不复制到低级别环境。资源统一打标签并设置配额，便于成本归属与容量治理。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '基础设施即代码',
+        paragraphs: [
+          '环境与基础设施层用声明式代码描述云资源与集群对象，常见组合是用 Terraform 管理云资源、Kubernetes 管理运行时、Helm 或 Kustomize 管理应用清单。环境差异通过参数与叠加层表达，而不是手工修改。任何环境都应能从代码重建，避免无法复现的“雪花服务器”。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '持续部署',
+      },
+      {
+        level: 2,
+        heading: 'GitOps 收敛',
+        paragraphs: [
+          '持续部署层采用 GitOps：部署清单以配置仓库为唯一来源，集群内的代理持续比对期望状态与实际状态并自动收敛，常见实现是 Argo CD 或 Flux。发布按环境逐级晋升，开发与测试自动部署，预发与生产需要审批。每次部署都记录版本、提交号、执行人与时间，形成审计链。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '发布策略',
+        paragraphs: [
+          '发布策略按风险选择：无状态服务默认滚动更新；核心服务使用金丝雀发布，先导入少量流量观察错误率和延迟，再逐步扩大；对一致性要求高或跨版本兼容困难的场景使用蓝绿发布。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '数据库变更',
+        paragraphs: [
+          '数据库变更与代码发布解耦，遵循“先扩展、后迁移、再收缩”：先增加兼容字段，双写并迁移数据，确认无误后再删除旧结构。只有这样新旧版本才能同时运行，回滚才不会被数据结构卡住。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '配置与密钥',
+        paragraphs: [
+          '配置与密钥管理遵循“仓库里没有秘密”。普通配置按环境注入，敏感信息存放在集中式密钥管理系统，由工作负载在运行时拉取，并支持轮换与吊销。密钥一旦进入提交历史就视为泄露，必须立即轮换，而不是只删除文件。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '可观测性',
+      },
+      {
+        level: 2,
+        heading: '三类数据',
+        paragraphs: [
+          '可观测层统一采集指标、日志和链路追踪，三者使用一致的服务名、版本与环境标签。指标用于告警和容量规划，日志用于定位具体事件，链路用于分析跨服务延迟。常用组合是 Prometheus 加 Grafana、Loki 或 ELK、OpenTelemetry。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '告警',
+        paragraphs: [
+          '告警只保留可行动项，每条告警对应明确的分级与处理手册。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '安全与合规',
+        paragraphs: [
+          '安全以 DevSecOps 的方式嵌入流水线：依赖扫描、镜像扫描、密钥扫描、静态与动态分析按阶段执行，高危问题直接阻断发布。权限遵循最小化原则，人与流水线使用不同的身份，生产操作全部留痕；紧急通道单独授权，事后必须审计。供应链侧还需要生成 SBOM 并对制品签名。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '回滚与故障处理',
+      },
+      {
+        level: 2,
+        heading: '回滚',
+        paragraphs: [
+          '回滚不是例外流程，而是默认能力。镜像不可变与数据库向后兼容是一键回滚的前提。每次发布前都应验证回滚路径，而不是等故障发生时才发现回不去。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '故障响应',
+        paragraphs: [
+          '故障处理先止损、再定位：优先恢复服务，其次分析根因。复盘关注流程与自动化缺口，把结论落实为新的检查项或监控项，而不是依赖个人记忆。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '度量与改进',
+        paragraphs: [
+          '度量体系使用四个指标：部署频率、变更前置时间、变更失败率、故障恢复时间。它们反映的是流程瓶颈，而不是团队人数；此外还应关注流水线时长与回滚率。',
+        ],
+      },
+      {
+        level: 1,
+        heading: '误区与边界',
+      },
+      {
+        level: 2,
+        heading: '常见误区',
+        paragraphs: [
+          '常见误区是把 DevOps 等同于一条部署流水线。流水线只是其中一环，真正的差距在环境一致性、制品不可变、密钥治理和回滚能力。另一个误区是追求全自动却忽略审批边界：生产变更的授权、审计与合规要求必须显式设计，不能依赖默认行为。',
+        ],
+      },
+      {
+        level: 2,
+        heading: '能力边界',
+        paragraphs: [
+          '最后需要明确边界：这套架构不能消除故障，只能缩小影响范围、缩短恢复时间。灰度、限流、熔断和回滚是配套的运行时能力，缺少其中任何一项，自动化发布都会放大风险。',
+        ],
+      },
+    ],
+    figure: 'devops-architecture',
   },
 ];
 
@@ -885,6 +1129,322 @@ function LanguagesWindow({ onClose }: { onClose: () => void }) {
   );
 }
 
+function BlogHeading({ level, text, compact }: { level: 1 | 2; text: string; compact: boolean }) {
+  const style: CSSProperties = {
+    margin: 0,
+    fontFamily: fonts.display,
+    fontWeight: 600,
+    fontSize: level === 1 ? (compact ? 20 : 23) : compact ? 16 : 17,
+    lineHeight: 1.3,
+    letterSpacing: level === 1 ? '-0.05em' : '-0.03em',
+    color: level === 1 ? 'rgb(20,20,22)' : 'rgb(48,48,52)',
+  };
+
+  return level === 1 ? <h2 style={style}>{text}</h2> : <h3 style={style}>{text}</h3>;
+}
+
+function BlogParagraph({ text, compact }: { text: string; compact: boolean }) {
+  return (
+    <p
+      style={{
+        margin: 0,
+        fontFamily: fonts.body,
+        fontWeight: 400,
+        fontSize: compact ? 15 : 16,
+        lineHeight: 1.85,
+        letterSpacing: '-0.025em',
+        color: 'rgb(55,55,59)',
+        overflowWrap: 'anywhere',
+      }}
+    >
+      {text}
+    </p>
+  );
+}
+
+type DiagramNode = {
+  kind: 'source' | 'stage' | 'brief';
+  tag?: string;
+  title: string;
+  lines?: string[];
+};
+
+const devopsDiagramNodes: DiagramNode[] = [
+  { kind: 'source', title: '开发者  →  合并请求 (MR)' },
+  {
+    kind: 'stage',
+    tag: '01',
+    title: '源码与协作 · Git = 唯一可信源',
+    lines: [
+      '应用代码 / 基础设施声明 / K8s 清单 / 流水线定义',
+      '主干保护 · 短生命周期分支 · 合并请求评审',
+    ],
+  },
+  {
+    kind: 'stage',
+    tag: '02',
+    title: '持续集成 · 失败即阻断合并（目标 < 10 分钟）',
+    lines: [
+      '代码检查 → 单元测试 → 静态分析 → 依赖与密钥扫描 → 镜像构建',
+      '流水线定义与代码同仓库，修改流水线同样要评审',
+    ],
+  },
+  {
+    kind: 'stage',
+    tag: '03',
+    title: '制品管理 · 一次构建，多环境晋升',
+    lines: ['不可变标签 (commit sha) · 制品签名 · 漏洞扫描', '禁止 latest，禁止按环境重新构建'],
+  },
+  {
+    kind: 'stage',
+    tag: '04',
+    title: '环境与基础设施 · 声明式重建，拒绝雪花服务器',
+    lines: [
+      '开发 → 测试 → 预发 → 生产（账号 / 命名空间 / 网络 / 权限隔离）',
+      'Terraform + Kubernetes + Helm / Kustomize · 密钥 Vault / KMS 运行时注入',
+    ],
+  },
+  {
+    kind: 'stage',
+    tag: '05',
+    title: '持续部署 (GitOps) · 配置仓库 = 期望状态',
+    lines: [
+      'Argo CD / Flux 持续比对并收敛 · 自动：开发 / 测试 · 审批：预发 / 生产',
+      '发布策略：滚动 / 金丝雀 / 蓝绿 · 数据库：先扩展 → 后迁移 → 再收缩',
+    ],
+  },
+  {
+    kind: 'stage',
+    tag: '06',
+    title: '可观测与反馈 · 统一 service / version / env 标签',
+    lines: [
+      '指标 Prometheus + Grafana · 日志 Loki / ELK · 链路 OpenTelemetry',
+      '告警 = 可行动项 + 分级 + 处理手册',
+    ],
+  },
+  {
+    kind: 'brief',
+    tag: '07',
+    title: '反馈闭环',
+    lines: ['告警 / 复盘结论 → 新的检查项、监控项、告警规则 → 回到 01 / 02'],
+  },
+];
+
+const devopsDiagramArrows = [
+  '提交 / 评审',
+  '触发',
+  '产出（一次构建）',
+  '晋升（同一个 digest）',
+  '部署（同一制品）',
+  '运行',
+  '告警 / 复盘结论',
+];
+
+function DevOpsArchitectureDiagram({ compact }: { compact: boolean }) {
+  const boxX = 36;
+  const boxW = 620;
+  const railX = 700;
+  const padTop = 18;
+  const gap = 40;
+  const heights = devopsDiagramNodes.map((node) =>
+    node.kind === 'stage' ? 86 : node.kind === 'brief' ? 68 : 48,
+  );
+
+  const tops: number[] = [];
+  let cursor = padTop;
+  for (const height of heights) {
+    tops.push(cursor);
+    cursor += height + gap;
+  }
+
+  const bandY = cursor + 6;
+  const bandH = 96;
+  const viewH = bandY + bandH + padTop;
+  const centers = tops.map((top, index) => top + heights[index] / 2);
+  const railMidY = (centers[1] + centers[centers.length - 1]) / 2;
+  const feedback = [
+    `M ${boxX + boxW} ${centers[centers.length - 1]}`,
+    `H ${railX}`,
+    `V ${centers[1]}`,
+    `H ${boxX + boxW}`,
+  ].join(' ');
+
+  return (
+    <div
+      style={{
+        minWidth: 0,
+        maxWidth: '100%',
+        padding: compact ? 10 : 14,
+        border: '1px solid rgb(229,229,234)',
+        borderRadius: 16,
+        background: 'white',
+        overflowX: 'auto',
+      }}
+    >
+      <svg
+        role="img"
+        aria-label="企业级 DevOps 架构图：从提交、集成、制品、环境、部署到可观测的完整链路，以及回到源码与流水线的反馈闭环"
+        viewBox={`0 0 760 ${viewH}`}
+        style={{ display: 'block', width: '100%', minWidth: 620, maxWidth: 760, height: 'auto' }}
+      >
+        <defs>
+          <marker
+            id="devops-flow-arrow"
+            viewBox="0 0 10 10"
+            refX="8.5"
+            refY="5"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 Z" fill="rgb(172,172,180)" />
+          </marker>
+        </defs>
+
+        {devopsDiagramNodes.map((node, index) => {
+          const top = tops[index];
+          const height = heights[index];
+          const filled = node.kind === 'stage';
+
+          return (
+            <g key={node.tag ?? node.kind}>
+              <rect
+                x={boxX}
+                y={top}
+                width={boxW}
+                height={height}
+                rx={14}
+                fill={filled ? 'white' : 'rgb(250,250,252)'}
+                stroke="rgb(229,229,234)"
+                strokeDasharray={filled ? undefined : '4 4'}
+              />
+              {node.tag ? (
+                <>
+                  <rect x={boxX + 18} y={top + 18} width={30} height={22} rx={7} fill="rgb(240,240,244)" />
+                  <text
+                    x={boxX + 33}
+                    y={top + 33}
+                    textAnchor="middle"
+                    fontFamily={fonts.body}
+                    fontSize={11.5}
+                    fontWeight={600}
+                    fill="rgb(96,96,102)"
+                  >
+                    {node.tag}
+                  </text>
+                </>
+              ) : null}
+              {node.kind === 'source' ? (
+                <text
+                  x={boxX + boxW / 2}
+                  y={top + height / 2 + 5}
+                  textAnchor="middle"
+                  fontFamily={fonts.body}
+                  fontSize={15}
+                  fontWeight={600}
+                  fill="rgb(20,20,22)"
+                >
+                  {node.title}
+                </text>
+              ) : (
+                <text x={boxX + 62} y={top + 33} fontFamily={fonts.body} fontSize={15.5} fontWeight={600} fill="rgb(20,20,22)">
+                  {node.title}
+                </text>
+              )}
+              {node.lines?.map((line, lineIndex) => (
+                <text
+                  key={line}
+                  x={boxX + 62}
+                  y={top + 56 + lineIndex * 19}
+                  fontFamily={fonts.body}
+                  fontSize={12.5}
+                  fill="rgb(118,118,124)"
+                >
+                  {line}
+                </text>
+              ))}
+            </g>
+          );
+        })}
+
+        {devopsDiagramArrows.map((label, index) => {
+          const fromY = tops[index] + heights[index];
+          const toY = tops[index + 1];
+
+          return (
+            <g key={label}>
+              <line
+                x1={boxX + boxW / 2}
+                y1={fromY + 4}
+                x2={boxX + boxW / 2}
+                y2={toY - 6}
+                stroke="rgb(172,172,180)"
+                strokeWidth={1.4}
+                markerEnd="url(#devops-flow-arrow)"
+              />
+              <text
+                x={boxX + boxW / 2 + 12}
+                y={(fromY + toY) / 2 + 4}
+                fontFamily={fonts.body}
+                fontSize={11.5}
+                fill="rgb(134,134,139)"
+              >
+                {label}
+              </text>
+            </g>
+          );
+        })}
+
+        <path
+          d={feedback}
+          fill="none"
+          stroke="rgb(198,198,206)"
+          strokeWidth={1.4}
+          strokeDasharray="5 5"
+          markerEnd="url(#devops-flow-arrow)"
+        />
+        <text
+          x={railX + 14}
+          y={railMidY}
+          fontFamily={fonts.body}
+          fontSize={11.5}
+          fill="rgb(150,150,158)"
+          textAnchor="middle"
+          transform={`rotate(90 ${railX + 14} ${railMidY})`}
+        >
+          反馈闭环
+        </text>
+
+        <rect
+          x={boxX}
+          y={bandY}
+          width={boxW}
+          height={bandH}
+          rx={14}
+          fill="rgb(249,249,251)"
+          stroke="rgb(229,229,234)"
+          strokeDasharray="4 4"
+        />
+        <text x={boxX + 22} y={bandY + 30} fontFamily={fonts.body} fontSize={13.5} fontWeight={600} fill="rgb(20,20,22)">
+          横切 · 安全与合规 (DevSecOps)
+        </text>
+        <text x={boxX + 22} y={bandY + 51} fontFamily={fonts.body} fontSize={12.5} fill="rgb(118,118,124)">
+          最小权限 · 人与流水线身份隔离 · 生产操作全量审计 · 紧急通道单独授权 · SBOM + 制品签名
+        </text>
+        <text x={boxX + 22} y={bandY + 76} fontFamily={fonts.body} fontSize={13.5} fontWeight={600} fill="rgb(20,20,22)">
+          回滚 · 镜像不可变 + 数据库向后兼容 = 一键回滚（GitOps revert）
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+function sectionSpacing(level: 1 | 2, index: number, compact: boolean) {
+  if (index === 0) return 0;
+  if (level === 1) return compact ? 24 : 32;
+  return compact ? 12 : 18;
+}
+
 function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void }) {
   const compact = useIsCompactViewport();
 
@@ -916,23 +1476,27 @@ function BlogPostWindow({ post, onClose }: { post: BlogPost; onClose: () => void
           {post.title}
         </div>
         <div style={{ height: 1, background: 'rgb(229,229,234)' }} />
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {post.paragraphs.map((paragraph, paragraphIndex) => (
-            <p
-              key={`${post.id}-${paragraphIndex}`}
+        {post.figure === 'devops-architecture' ? <DevOpsArchitectureDiagram compact={compact} /> : null}
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {post.sections.map((section, sectionIndex) => (
+            <section
+              key={`${post.id}-${sectionIndex}`}
               style={{
-                margin: 0,
-                fontFamily: fonts.body,
-                fontWeight: 400,
-                fontSize: compact ? 15 : 16,
-                lineHeight: 1.85,
-                letterSpacing: '-0.025em',
-                color: 'rgb(55,55,59)',
-                overflowWrap: 'anywhere',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 16,
+                marginTop: sectionSpacing(section.level, sectionIndex, compact),
               }}
             >
-              {paragraph}
-            </p>
+              <BlogHeading level={section.level} text={section.heading} compact={compact} />
+              {section.paragraphs?.map((paragraph, paragraphIndex) => (
+                <BlogParagraph
+                  key={`${post.id}-${sectionIndex}-${paragraphIndex}`}
+                  text={paragraph}
+                  compact={compact}
+                />
+              ))}
+            </section>
           ))}
         </div>
       </article>
