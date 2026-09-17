@@ -471,7 +471,7 @@ const blogPosts: BlogPost[] = [
   {
      id: 'ai-data-review-loop',
      title: 'AI 化设施：建立数据评审闭环',
-     date: 'YYYY-MM-DD',
+     date: '2026-9-17',
      sections: [
        {
          level: 1,
